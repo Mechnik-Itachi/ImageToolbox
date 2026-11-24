@@ -25,7 +25,9 @@ jobs:
           cache: gradle
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
 
       - name: Install Android build tools
         run: |
@@ -43,6 +45,28 @@ jobs:
       - name: Build FOSS release
         run: ./gradlew :app:assembleFossRelease
 
+      - name: Find APK
+        run: |
+          set -euo pipefail
+
+          APK=$(find app/build/outputs/apk/foss/release \
+            -type f -name '*.apk' ! -name '*unsigned*' \
+            | head -1)
+
+          if [ -z "$APK" ]; then
+            APK=$(find app/build/outputs/apk/foss/release \
+              -type f -name '*.apk' | head -1)
+          fi
+
+          if [ -z "$APK" ]; then
+            echo "FOSS release APK not found!"
+            find app/build/outputs -type f
+            exit 1
+          fi
+
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+          echo "Found: $APK"
+
       - name: Sign APK
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
@@ -51,17 +75,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          APK=$(find app/build/outputs/apk/foss/release \
-            -type f -name '*-foss-universal-release-unsigned.apk' \
-            | head -1)
-
-          if [ -z "$APK" ]; then
-            echo "FOSS release APK not found!"
-            find app/build/outputs -name '*.apk'
-            exit 1
-          fi
-
-          SIGNED_APK="${APK%-unsigned.apk}.apk"
+          SIGNED_APK="${APK_PATH%.apk}-signed.apk"
 
           APKSIGNER=$(find "$ANDROID_HOME/build-tools" \
             -type f -name apksigner | sort -V | tail -1)
@@ -72,28 +86,30 @@ jobs:
             --ks-pass env:KEYSTORE_PASSWORD \
             --key-pass env:KEY_PASSWORD \
             --out "$SIGNED_APK" \
-            "$APK"
+            "$APK_PATH"
 
           "$APKSIGNER" verify --verbose "$SIGNED_APK"
 
-          echo "APK_PATH=$SIGNED_APK" >> "$GITHUB_ENV"
+          echo "SIGNED_APK=$SIGNED_APK" >> "$GITHUB_ENV"
 
       - name: Read version
         id: ver
         run: |
-          APK_NAME=$(basename "$APK_PATH")
-          VN="${APK_NAME#image-toolbox-}"
-          VN="${VN%-foss-universal-release.apk}"
+          VERSION=$(grep -RhoE 'versionName[[:space:]]*=[[:space:]]*"[^"]+"' \
+            app/build.gradle.kts build.gradle.kts 2>/dev/null \
+            | head -1 \
+            | sed -E 's/.*"([^"]+)".*/\1/')
 
-          if [ "$VN" = "$APK_NAME" ] || [ -z "$VN" ]; then
+          if [ -z "$VERSION" ]; then
+            VERSION=$(basename "$SIGNED_APK" | sed -E 's/.*-([0-9]+\.[0-9]+[^-]*)-signed\.apk/\1/')
+          fi
+
+          if [ -z "$VERSION" ]; then
             echo "Could not determine application version!"
             exit 1
           fi
 
-          echo "name=$VN" >> "$GITHUB_OUTPUT"
-
-      - name: List APKs
-        run: find app/build/outputs -name '*.apk'
+          echo "name=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Publish release
         env:
@@ -101,10 +117,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          VN="${{ steps.ver.outputs.name }}"
-          TAG="v${VN}-$(date +%Y%m%d%H%M)"
+          VERSION="${{ steps.ver.outputs.name }}"
+          TAG="v${VERSION}-$(date +%Y%m%d%H%M)"
 
-          gh release create "$TAG" "$APK_PATH" \
-            --title "ImageToolbox $VN (FOSS)" \
-            --notes "Сборка ImageToolbox FOSS подписана личным ключом."
-            
+          gh release create "$TAG" "$SIGNED_APK" \
+            --title "ImageToolbox $VERSION (FOSS)" \
+            --notes "FOSS-сборка ImageToolbox подписана личным ключом."
